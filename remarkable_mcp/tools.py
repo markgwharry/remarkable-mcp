@@ -1,8 +1,9 @@
 """
 MCP Tools for reMarkable tablet access.
 
-All tools are read-only and idempotent - they only retrieve data from the
-reMarkable Cloud and do not modify any documents.
+Read-only tools retrieve data from the reMarkable Cloud or SSH connection.
+Write tools (tag, rename, move, delete) require SSH mode and will modify
+documents on the tablet by stopping and restarting the xochitl service.
 """
 
 import base64
@@ -148,6 +149,43 @@ STATUS_ANNOTATIONS = ToolAnnotations(
 IMAGE_ANNOTATIONS = ToolAnnotations(
     title="Get reMarkable Page Image",
     **_BASE_ANNOTATIONS,
+)
+
+# Write operation annotations - destructive and non-idempotent
+_WRITE_BASE_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "destructiveHint": True,
+    "openWorldHint": False,
+}
+
+TAG_ANNOTATIONS = ToolAnnotations(
+    title="Tag reMarkable Document",
+    idempotentHint=False,  # Adding tags multiple times creates duplicates
+    **_WRITE_BASE_ANNOTATIONS,
+)
+
+RENAME_ANNOTATIONS = ToolAnnotations(
+    title="Rename reMarkable Document",
+    idempotentHint=True,  # Renaming to same name is idempotent
+    **_WRITE_BASE_ANNOTATIONS,
+)
+
+MOVE_ANNOTATIONS = ToolAnnotations(
+    title="Move reMarkable Document",
+    idempotentHint=True,  # Moving to same location is idempotent
+    **_WRITE_BASE_ANNOTATIONS,
+)
+
+DELETE_ANNOTATIONS = ToolAnnotations(
+    title="Delete reMarkable Document",
+    idempotentHint=True,  # Deleting already deleted doc is idempotent
+    **_WRITE_BASE_ANNOTATIONS,
+)
+
+CREATE_FOLDER_ANNOTATIONS = ToolAnnotations(
+    title="Create reMarkable Folder",
+    idempotentHint=False,  # Creating folders with same name creates duplicates
+    **_WRITE_BASE_ANNOTATIONS,
 )
 
 # Default page size for pagination (characters) - used for PDFs/EPUBs
@@ -1594,4 +1632,445 @@ async def remarkable_image(
             error_type="image_failed",
             message=str(e),
             suggestion="Check remarkable_status() to verify your connection.",
+        )
+
+
+@mcp.tool(annotations=TAG_ANNOTATIONS)
+def remarkable_tag(path: str, tag: str, page: Optional[int] = None) -> str:
+    """
+    <usecase>Add a tag to a reMarkable document or page.</usecase>
+    <instructions>
+    Add a tag to a document. If page number is specified, adds a page tag.
+    Otherwise adds a document tag visible in the library.
+
+    NOTE: This operation requires SSH mode (REMARKABLE_USE_SSH=true) and will
+    stop/restart the xochitl service on the tablet.
+
+    Args:
+        path: Document path (e.g., "/Work/Notes" or "Notes")
+        tag: Tag name to add
+        page: Optional page number (1-indexed) for page tags
+    </instructions>
+    <examples>
+    - remarkable_tag("/Work/Notes", "Follow Up")
+    - remarkable_tag("Meeting Notes", "Important", page=1)
+    </examples>
+    """
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, get_rmapi
+
+    if not REMARKABLE_USE_SSH:
+        return make_error(
+            error_type="ssh_required",
+            message="Write operations require SSH mode",
+            suggestion="Set REMARKABLE_USE_SSH=true and connect your tablet via USB. "
+            "See: https://remarkable.guide/guide/access/ssh.html",
+        )
+
+    try:
+        # Resolve path and get document
+        resolved_path = _resolve_root_path(path)
+        client = get_rmapi()
+        collection = client.get_meta_items()
+        items_by_id = get_items_by_id(collection)
+
+        target_doc = None
+        for item in collection:
+            if item.is_folder:
+                continue
+            item_path = get_item_path(item, items_by_id)
+            if item_path.lower() == resolved_path.lower():
+                target_doc = item
+                break
+
+        if not target_doc:
+            return make_error(
+                error_type="document_not_found",
+                message=f"Document not found: {path}",
+                suggestion="Use remarkable_browse() to see available documents.",
+            )
+
+        # Handle page tags
+        page_id = None
+        if page is not None:
+            # Need to download .content to get page UUIDs
+            doc_zip = client.download(target_doc)
+            import json
+            import zipfile
+            import io
+
+            with zipfile.ZipFile(io.BytesIO(doc_zip), "r") as zf:
+                content_data = None
+                for name in zf.namelist():
+                    if name.endswith(".content"):
+                        content_data = json.loads(zf.read(name))
+                        break
+
+                if not content_data or "cPages" not in content_data:
+                    return make_error(
+                        error_type="page_not_found",
+                        message=f"Document does not have page structure",
+                        suggestion="Use document tags instead (omit the page parameter).",
+                    )
+
+                pages = content_data.get("cPages", {}).get("pages", [])
+                if page < 1 or page > len(pages):
+                    return make_error(
+                        error_type="page_not_found",
+                        message=f"Page {page} not found (document has {len(pages)} pages)",
+                        suggestion=f"Use a page number between 1 and {len(pages)}.",
+                    )
+
+                # Convert 1-indexed page to 0-indexed array
+                page_id = pages[page - 1]["id"]
+
+        # Add tag
+        client.add_tag(target_doc.ID, tag, page_id)
+
+        tag_type = "page tag" if page_id else "document tag"
+        result = {
+            "path": _apply_root_filter(get_item_path(target_doc, items_by_id)),
+            "document_id": target_doc.ID,
+            "tag": tag,
+            "tag_type": tag_type,
+        }
+        if page:
+            result["page"] = page
+
+        hint = f"Added {tag_type} '{tag}' to '{target_doc.VissibleName}'"
+        if page:
+            hint += f" (page {page})"
+
+        return make_response(result, hint)
+
+    except Exception as e:
+        return make_error(
+            error_type="tag_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify SSH connection.",
+        )
+
+
+@mcp.tool(annotations=RENAME_ANNOTATIONS)
+def remarkable_rename(path: str, new_name: str) -> str:
+    """
+    <usecase>Rename a reMarkable document or folder.</usecase>
+    <instructions>
+    Rename a document or folder to a new name.
+
+    NOTE: This operation requires SSH mode (REMARKABLE_USE_SSH=true) and will
+    stop/restart the xochitl service on the tablet.
+
+    Args:
+        path: Document or folder path (e.g., "/Work/Notes" or "Notes")
+        new_name: New name for the document/folder
+    </instructions>
+    <examples>
+    - remarkable_rename("/Work/Notes", "Meeting Notes")
+    - remarkable_rename("Draft", "Final Version")
+    </examples>
+    """
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, get_rmapi
+
+    if not REMARKABLE_USE_SSH:
+        return make_error(
+            error_type="ssh_required",
+            message="Write operations require SSH mode",
+            suggestion="Set REMARKABLE_USE_SSH=true and connect your tablet via USB. "
+            "See: https://remarkable.guide/guide/access/ssh.html",
+        )
+
+    try:
+        # Resolve path and get item
+        resolved_path = _resolve_root_path(path)
+        client = get_rmapi()
+        collection = client.get_meta_items()
+        items_by_id = get_items_by_id(collection)
+
+        target_item = None
+        for item in collection:
+            item_path = get_item_path(item, items_by_id)
+            if item_path.lower() == resolved_path.lower():
+                target_item = item
+                break
+
+        if not target_item:
+            return make_error(
+                error_type="item_not_found",
+                message=f"Item not found: {path}",
+                suggestion="Use remarkable_browse() to see available items.",
+            )
+
+        old_name = target_item.VissibleName
+        client.rename_document(target_item.ID, new_name)
+
+        result = {
+            "path": _apply_root_filter(get_item_path(target_item, items_by_id)),
+            "item_id": target_item.ID,
+            "old_name": old_name,
+            "new_name": new_name,
+            "type": "folder" if target_item.is_folder else "document",
+        }
+
+        hint = f"Renamed '{old_name}' to '{new_name}'"
+
+        return make_response(result, hint)
+
+    except Exception as e:
+        return make_error(
+            error_type="rename_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify SSH connection.",
+        )
+
+
+@mcp.tool(annotations=MOVE_ANNOTATIONS)
+def remarkable_move(path: str, destination: str) -> str:
+    """
+    <usecase>Move a reMarkable document or folder to a different location.</usecase>
+    <instructions>
+    Move a document or folder to a different folder or to the root.
+
+    NOTE: This operation requires SSH mode (REMARKABLE_USE_SSH=true) and will
+    stop/restart the xochitl service on the tablet.
+
+    Args:
+        path: Document or folder path to move (e.g., "/Work/Notes")
+        destination: Destination folder path, or "/" for root level
+    </instructions>
+    <examples>
+    - remarkable_move("/Notes", "/Work")
+    - remarkable_move("/Work/Draft", "/")
+    </examples>
+    """
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, get_rmapi
+
+    if not REMARKABLE_USE_SSH:
+        return make_error(
+            error_type="ssh_required",
+            message="Write operations require SSH mode",
+            suggestion="Set REMARKABLE_USE_SSH=true and connect your tablet via USB. "
+            "See: https://remarkable.guide/guide/access/ssh.html",
+        )
+
+    try:
+        # Resolve paths and get items
+        resolved_path = _resolve_root_path(path)
+        resolved_dest = _resolve_root_path(destination)
+
+        client = get_rmapi()
+        collection = client.get_meta_items()
+        items_by_id = get_items_by_id(collection)
+
+        # Find source item
+        target_item = None
+        for item in collection:
+            item_path = get_item_path(item, items_by_id)
+            if item_path.lower() == resolved_path.lower():
+                target_item = item
+                break
+
+        if not target_item:
+            return make_error(
+                error_type="item_not_found",
+                message=f"Item not found: {path}",
+                suggestion="Use remarkable_browse() to see available items.",
+            )
+
+        # Find destination folder (or root)
+        dest_id = ""  # Root by default
+        if resolved_dest != "/":
+            dest_folder = None
+            for item in collection:
+                if not item.is_folder:
+                    continue
+                item_path = get_item_path(item, items_by_id)
+                if item_path.lower() == resolved_dest.lower():
+                    dest_folder = item
+                    break
+
+            if not dest_folder:
+                return make_error(
+                    error_type="folder_not_found",
+                    message=f"Destination folder not found: {destination}",
+                    suggestion="Use remarkable_browse() to see available folders.",
+                )
+            dest_id = dest_folder.ID
+
+        old_parent = target_item.Parent
+        client.move_document(target_item.ID, dest_id)
+
+        dest_name = "root" if dest_id == "" else destination
+
+        result = {
+            "path": _apply_root_filter(get_item_path(target_item, items_by_id)),
+            "item_id": target_item.ID,
+            "name": target_item.VissibleName,
+            "destination": dest_name,
+            "destination_id": dest_id,
+            "type": "folder" if target_item.is_folder else "document",
+        }
+
+        hint = f"Moved '{target_item.VissibleName}' to '{dest_name}'"
+
+        return make_response(result, hint)
+
+    except Exception as e:
+        return make_error(
+            error_type="move_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify SSH connection.",
+        )
+
+
+@mcp.tool(annotations=DELETE_ANNOTATIONS)
+def remarkable_delete(path: str) -> str:
+    """
+    <usecase>Delete a reMarkable document or folder (move to trash).</usecase>
+    <instructions>
+    Soft delete a document or folder by moving it to the trash.
+    The item can be restored from the tablet's trash folder.
+
+    NOTE: This operation requires SSH mode (REMARKABLE_USE_SSH=true) and will
+    stop/restart the xochitl service on the tablet.
+
+    Args:
+        path: Document or folder path to delete (e.g., "/Work/Notes")
+    </instructions>
+    <examples>
+    - remarkable_delete("/Work/Old Notes")
+    - remarkable_delete("Draft")
+    </examples>
+    """
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, get_rmapi
+
+    if not REMARKABLE_USE_SSH:
+        return make_error(
+            error_type="ssh_required",
+            message="Write operations require SSH mode",
+            suggestion="Set REMARKABLE_USE_SSH=true and connect your tablet via USB. "
+            "See: https://remarkable.guide/guide/access/ssh.html",
+        )
+
+    try:
+        # Resolve path and get item
+        resolved_path = _resolve_root_path(path)
+        client = get_rmapi()
+        collection = client.get_meta_items()
+        items_by_id = get_items_by_id(collection)
+
+        target_item = None
+        for item in collection:
+            item_path = get_item_path(item, items_by_id)
+            if item_path.lower() == resolved_path.lower():
+                target_item = item
+                break
+
+        if not target_item:
+            return make_error(
+                error_type="item_not_found",
+                message=f"Item not found: {path}",
+                suggestion="Use remarkable_browse() to see available items.",
+            )
+
+        client.delete_document(target_item.ID)
+
+        result = {
+            "path": _apply_root_filter(get_item_path(target_item, items_by_id)),
+            "item_id": target_item.ID,
+            "name": target_item.VissibleName,
+            "type": "folder" if target_item.is_folder else "document",
+            "deleted": True,
+        }
+
+        hint = (
+            f"Moved '{target_item.VissibleName}' to trash. "
+            "It can be restored from the trash folder on your tablet."
+        )
+
+        return make_response(result, hint)
+
+    except Exception as e:
+        return make_error(
+            error_type="delete_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify SSH connection.",
+        )
+
+
+@mcp.tool(annotations=CREATE_FOLDER_ANNOTATIONS)
+def remarkable_create_folder(name: str, parent: str = "/") -> str:
+    """
+    <usecase>Create a new folder on the reMarkable tablet.</usecase>
+    <instructions>
+    Create a new folder at the specified location.
+
+    NOTE: This operation requires SSH mode (REMARKABLE_USE_SSH=true) and will
+    stop/restart the xochitl service on the tablet.
+
+    Args:
+        name: Name for the new folder
+        parent: Parent folder path, or "/" for root level (default: "/")
+    </instructions>
+    <examples>
+    - remarkable_create_folder("Projects")
+    - remarkable_create_folder("Meeting Notes", "/Work")
+    </examples>
+    """
+    from remarkable_mcp.api import REMARKABLE_USE_SSH, get_rmapi
+
+    if not REMARKABLE_USE_SSH:
+        return make_error(
+            error_type="ssh_required",
+            message="Write operations require SSH mode",
+            suggestion="Set REMARKABLE_USE_SSH=true and connect your tablet via USB. "
+            "See: https://remarkable.guide/guide/access/ssh.html",
+        )
+
+    try:
+        # Resolve parent path and get parent folder ID
+        resolved_parent = _resolve_root_path(parent)
+        client = get_rmapi()
+        collection = client.get_meta_items()
+        items_by_id = get_items_by_id(collection)
+
+        parent_id = ""  # Root by default
+        if resolved_parent != "/":
+            parent_folder = None
+            for item in collection:
+                if not item.is_folder:
+                    continue
+                item_path = get_item_path(item, items_by_id)
+                if item_path.lower() == resolved_parent.lower():
+                    parent_folder = item
+                    break
+
+            if not parent_folder:
+                return make_error(
+                    error_type="folder_not_found",
+                    message=f"Parent folder not found: {parent}",
+                    suggestion="Use remarkable_browse() to see available folders.",
+                )
+            parent_id = parent_folder.ID
+
+        # Create folder
+        folder_id = client.create_folder(name, parent_id)
+
+        parent_name = "root" if parent_id == "" else parent
+
+        result = {
+            "folder_id": folder_id,
+            "name": name,
+            "parent": parent_name,
+            "parent_id": parent_id,
+        }
+
+        hint = f"Created folder '{name}' in '{parent_name}'"
+
+        return make_response(result, hint)
+
+    except Exception as e:
+        return make_error(
+            error_type="create_folder_failed",
+            message=str(e),
+            suggestion="Check remarkable_status() to verify SSH connection.",
         )

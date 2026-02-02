@@ -188,6 +188,250 @@ class SSHClient:
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"SSH cat timed out after {timeout}s")
 
+    def _scp_upload(self, content: bytes, remote_path: str, timeout: int = 60) -> None:
+        """Upload content to a file on the tablet via SSH."""
+        # Use SSH with stdin redirection to write the file
+        ssh_args = [
+            "ssh",
+            "-o",
+            "ConnectTimeout=5",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-p",
+            str(self.port),
+            f"{self.user}@{self.host}",
+            f"cat > '{remote_path}'",
+        ]
+
+        # If no password, use BatchMode for key-based auth
+        if not self.password:
+            ssh_args.insert(1, "-o")
+            ssh_args.insert(2, "BatchMode=yes")
+        else:
+            # Use sshpass for password authentication
+            ssh_args = ["sshpass", "-p", self.password] + ssh_args
+
+        try:
+            result = subprocess.run(
+                ssh_args,
+                input=content,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"SSH upload failed: {result.stderr.decode()}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"SSH upload timed out after {timeout}s")
+
+    def _stop_xochitl(self) -> None:
+        """Stop the xochitl service on the tablet.
+
+        This is required before making any write modifications to documents.
+        """
+        logger.info("Stopping xochitl service")
+        self._ssh_command("systemctl stop xochitl", timeout=10)
+
+    def _start_xochitl(self) -> None:
+        """Start the xochitl service on the tablet.
+
+        This should be called after write modifications are complete.
+        """
+        logger.info("Starting xochitl service")
+        self._ssh_command("systemctl start xochitl", timeout=10)
+
+    def _modify_with_xochitl_stopped(self, operation_func) -> None:
+        """
+        Execute a modification operation with xochitl stopped.
+
+        This is a safety wrapper that ensures xochitl is stopped before
+        modifications and restarted after, even if an error occurs.
+        """
+        try:
+            self._stop_xochitl()
+            operation_func()
+        finally:
+            self._start_xochitl()
+
+    def add_tag(
+        self, doc_id: str, tag_name: str, page_id: Optional[str] = None
+    ) -> None:
+        """
+        Add a tag to a document.
+
+        Args:
+            doc_id: The document UUID
+            tag_name: Name of the tag to add
+            page_id: If specified, adds a page tag. If None, adds a document tag.
+
+        Raises:
+            RuntimeError: If the operation fails
+        """
+        import time
+
+        def operation():
+            timestamp = int(time.time() * 1000)
+
+            # Download .content file
+            content_path = f"{XOCHITL_PATH}/{doc_id}.content"
+            content_bytes = self._scp_download(content_path)
+            content = json.loads(content_bytes.decode("utf-8"))
+
+            # Add tag based on type
+            if page_id:
+                # Page tag
+                if "pageTags" not in content:
+                    content["pageTags"] = []
+                content["pageTags"].append(
+                    {"name": tag_name, "pageId": page_id, "timestamp": timestamp}
+                )
+                logger.info(f"Adding page tag '{tag_name}' to page {page_id}")
+            else:
+                # Document tag
+                if "tags" not in content:
+                    content["tags"] = []
+                content["tags"].append({"name": tag_name, "timestamp": timestamp})
+                logger.info(f"Adding document tag '{tag_name}'")
+
+            # Upload modified .content
+            content_json = json.dumps(content, indent=4).encode("utf-8")
+            self._scp_upload(content_json, content_path)
+
+            # Update .metadata with new timestamp
+            metadata_path = f"{XOCHITL_PATH}/{doc_id}.metadata"
+            metadata_bytes = self._scp_download(metadata_path)
+            metadata = json.loads(metadata_bytes.decode("utf-8"))
+            metadata["lastModified"] = str(timestamp)
+
+            metadata_json = json.dumps(metadata, indent=4).encode("utf-8")
+            self._scp_upload(metadata_json, metadata_path)
+
+        self._modify_with_xochitl_stopped(operation)
+        logger.info(f"Successfully added tag '{tag_name}' to document {doc_id}")
+
+    def rename_document(self, doc_id: str, new_name: str) -> None:
+        """
+        Rename a document.
+
+        Args:
+            doc_id: The document UUID
+            new_name: New name for the document
+
+        Raises:
+            RuntimeError: If the operation fails
+        """
+
+        def operation():
+            metadata_path = f"{XOCHITL_PATH}/{doc_id}.metadata"
+            metadata_bytes = self._scp_download(metadata_path)
+            metadata = json.loads(metadata_bytes.decode("utf-8"))
+
+            old_name = metadata.get("visibleName", "Unknown")
+            metadata["visibleName"] = new_name
+
+            metadata_json = json.dumps(metadata, indent=4).encode("utf-8")
+            self._scp_upload(metadata_json, metadata_path)
+
+            logger.info(f"Renamed document from '{old_name}' to '{new_name}'")
+
+        self._modify_with_xochitl_stopped(operation)
+        logger.info(f"Successfully renamed document {doc_id}")
+
+    def move_document(self, doc_id: str, parent_id: str) -> None:
+        """
+        Move a document to a different folder.
+
+        Args:
+            doc_id: The document UUID
+            parent_id: The parent folder UUID, or "" for root, or "trash" for trash
+
+        Raises:
+            RuntimeError: If the operation fails
+        """
+        import time
+
+        def operation():
+            metadata_path = f"{XOCHITL_PATH}/{doc_id}.metadata"
+            metadata_bytes = self._scp_download(metadata_path)
+            metadata = json.loads(metadata_bytes.decode("utf-8"))
+
+            old_parent = metadata.get("parent", "")
+            metadata["parent"] = parent_id
+            metadata["lastModified"] = str(int(time.time() * 1000))
+
+            metadata_json = json.dumps(metadata, indent=4).encode("utf-8")
+            self._scp_upload(metadata_json, metadata_path)
+
+            old_location = "root" if old_parent == "" else old_parent
+            new_location = "root" if parent_id == "" else parent_id
+            logger.info(f"Moved document from '{old_location}' to '{new_location}'")
+
+        self._modify_with_xochitl_stopped(operation)
+        logger.info(f"Successfully moved document {doc_id}")
+
+    def delete_document(self, doc_id: str) -> None:
+        """
+        Delete a document (soft delete - moves to trash).
+
+        Args:
+            doc_id: The document UUID
+
+        Raises:
+            RuntimeError: If the operation fails
+        """
+        logger.info(f"Moving document {doc_id} to trash")
+        self.move_document(doc_id, "trash")
+
+    def create_folder(self, folder_name: str, parent_id: str = "") -> str:
+        """
+        Create a new folder.
+
+        Args:
+            folder_name: Name of the new folder
+            parent_id: Parent folder UUID, or "" for root level
+
+        Returns:
+            UUID of the created folder
+
+        Raises:
+            RuntimeError: If the operation fails
+        """
+        import time
+        import uuid
+
+        folder_id = str(uuid.uuid4())
+
+        def operation():
+            timestamp = int(time.time() * 1000)
+
+            # Create .metadata file
+            metadata = {
+                "createdTime": str(timestamp),
+                "lastModified": str(timestamp),
+                "parent": parent_id,
+                "pinned": False,
+                "type": "CollectionType",
+                "visibleName": folder_name,
+            }
+
+            metadata_path = f"{XOCHITL_PATH}/{folder_id}.metadata"
+            metadata_json = json.dumps(metadata, indent=4).encode("utf-8")
+            self._scp_upload(metadata_json, metadata_path)
+
+            # Create .content file
+            content = {"tags": []}
+
+            content_path = f"{XOCHITL_PATH}/{folder_id}.content"
+            content_json = json.dumps(content, indent=4).encode("utf-8")
+            self._scp_upload(content_json, content_path)
+
+            location = "root" if parent_id == "" else parent_id
+            logger.info(f"Created folder '{folder_name}' in '{location}'")
+
+        self._modify_with_xochitl_stopped(operation)
+        logger.info(f"Successfully created folder '{folder_name}' with ID {folder_id}")
+
+        return folder_id
+
     def check_connection(self) -> bool:
         """Check if SSH connection to tablet is available."""
         try:

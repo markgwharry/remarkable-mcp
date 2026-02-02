@@ -9,6 +9,7 @@ Unlock the full potential of your reMarkable tablet as a **second brain** for AI
 Your reMarkable tablet is a powerful tool for thinking, note-taking, and research. But that knowledge stays trapped on the device. This MCP server changes that:
 
 - **Full library access** — Browse folders, search documents, read any file
+- **Document organization** — Tag, rename, move, delete documents and create folders via SSH
 - **Typed text extraction** — Native support for Type Folio and typed annotations
 - **Handwriting OCR** — Convert handwritten notes to searchable text
 - **PDF & EPUB support** — Extract text from documents, plus your annotations
@@ -132,6 +133,8 @@ AI assistants use the tools to read documents, search content, and more:
 
 ## Tools
 
+### Read-Only Tools
+
 | Tool | Description |
 |------|-------------|
 | `remarkable_read` | Read and extract text from documents (with pagination and search) |
@@ -141,7 +144,19 @@ AI assistants use the tools to read documents, search content, and more:
 | `remarkable_status` | Check connection status |
 | `remarkable_image` | Get PNG/SVG images of pages (supports OCR via sampling) |
 
-All tools are **read-only** and return structured JSON with hints for next actions.
+### Write Tools (SSH Mode Only)
+
+**Note:** Write operations require SSH mode and will stop/restart the xochitl service on your tablet.
+
+| Tool | Description |
+|------|-------------|
+| `remarkable_tag` | Add tags to documents or specific pages |
+| `remarkable_rename` | Rename documents or folders |
+| `remarkable_move` | Move documents or folders to different locations |
+| `remarkable_delete` | Move documents or folders to trash (soft delete) |
+| `remarkable_create_folder` | Create new folders |
+
+All tools return structured JSON with hints for next actions.
 
 📖 **[Full Tools Documentation](docs/tools.md)**
 
@@ -188,6 +203,30 @@ remarkable_image("Logo Sketch", background="#00000000")
 
 # Compatibility mode: return resource URI instead of embedded resource
 remarkable_image("Diagram", compatibility=True)
+
+# Add a document tag (SSH only)
+remarkable_tag("Meeting Notes", "Follow Up")
+
+# Add a page tag (SSH only)
+remarkable_tag("Project Plan", "Important", page=3)
+
+# Rename a document (SSH only)
+remarkable_rename("Draft", "Final Version")
+
+# Move to a folder (SSH only)
+remarkable_move("Meeting Notes", "/Work/Archive")
+
+# Move to root (SSH only)
+remarkable_move("/Work/Archive/Old Notes", "/")
+
+# Delete document (SSH only)
+remarkable_delete("Old Draft")
+
+# Create a folder (SSH only)
+remarkable_create_folder("Projects")
+
+# Create a nested folder (SSH only)
+remarkable_create_folder("Meeting Notes", "/Work")
 ```
 
 ---
@@ -299,6 +338,7 @@ When `REMARKABLE_OCR_BACKEND=auto` (default):
 | Offline | ✅ Yes | ❌ No |
 | Subscription | ✅ Not required | ❌ Connect required |
 | Raw files | ✅ PDFs, EPUBs | ❌ Not available |
+| Write operations | ✅ Tag, rename, move, delete, create folders | ❌ Read-only |
 | Setup | Developer mode | One-time code |
 
 📖 **[SSH Setup Guide](docs/ssh-setup.md)**
